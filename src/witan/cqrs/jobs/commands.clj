@@ -1,17 +1,10 @@
 (ns witan.cqrs.jobs.commands
   (:require [clojure.core.async :refer [chan >! <! close! timeout go-loop]]
-            [cheshire.core :as json]
             [taoensso.timbre :as timbre]
             [onyx.plugin.core-async :refer [take-segments!]]
             [onyx.api]
             [onyx.plugin.kafka]
             [witan.cqrs.jobs.shared]))
-
-(defn deserialize-message-json [bytes]
-  (try
-    (json/parse-string (String. bytes "UTF-8") true)
-    (catch Exception e
-      {:error e})))
 
 (defn coerce [segment]
   (if (contains? segment :command)
@@ -19,18 +12,13 @@
     (assoc segment :error "Does not contain a command key")))
 
 (defn process [segment]
-  (assoc segment :processed? true))
+  {:message {:event (str "completed-" (:command segment))}})
 
 (def workflow
   [[:command/in-queue     :command/coerce]
    [:command/coerce       :command/store]
    [:command/coerce       :command/process]
-   [:command/process      :event/out-queue]
-   [:event/out-queue      :event/in-queue]
-   [:event/in-queue       :event/prepare-store]
-   [:event/prepare-store  :event/store]
-   [:event/in-queue       :event/aggregator]
-   [:event/aggregator     :event/store-aggregate]])
+   [:command/process      :event/out-queue]])
 
 (defn build-catalog
   [batch-size batch-timeout]
@@ -41,7 +29,7 @@
     :kafka/topic "command"
     :kafka/group-id "onyx-consumer"
     :kafka/zookeeper "127.0.0.1:2181"
-    :kafka/deserializer-fn :witan.cqrs.jobs.commands/deserialize-message-json
+    :kafka/deserializer-fn :witan.cqrs.jobs.shared/deserialize-message-json
     :onyx/plugin :onyx.plugin.kafka/read-messages
     :onyx/type :input
     :onyx/medium :kafka
@@ -68,47 +56,13 @@
     :onyx/doc "Process the command and converts it to an event"}
 
    {:onyx/name :event/out-queue
-    :onyx/fn :clojure.core/identity
-    :onyx/type :function
-    :onyx/batch-size batch-size
-    :onyx/batch-timeout batch-timeout
-    :onyx/doc "Write the event out to Kafka"}
-
-   {:onyx/name :event/in-queue
-    :onyx/fn :clojure.core/identity
-    :onyx/type :function
-    :onyx/batch-size batch-size
-    :onyx/batch-timeout batch-timeout
-    :onyx/doc "identity"}
-
-   {:onyx/name :event/prepare-store
-    :onyx/fn :clojure.core/identity
-    :onyx/type :function
-    :onyx/batch-size batch-size
-    :onyx/batch-timeout batch-timeout
-    :onyx/doc "identity"}
-
-   {:onyx/name :event/aggregator
-    :onyx/fn :clojure.core/identity
-    :onyx/type :function
-    :onyx/batch-size batch-size
-    :onyx/batch-timeout batch-timeout
-    :onyx/doc "identity"}
-
-   {:onyx/name :event/store
-    :onyx/plugin :onyx.peer.function/function
-    :onyx/fn :clojure.core/identity
+    :onyx/plugin :onyx.plugin.kafka/write-messages
     :onyx/type :output
-    :onyx/medium :function
-    :onyx/batch-size batch-size
-    :onyx/batch-timeout batch-timeout
-    :onyx/doc "Identity output"}
-
-   {:onyx/name :event/store-aggregate
-    :onyx/plugin :onyx.peer.function/function
-    :onyx/fn :clojure.core/identity
-    :onyx/type :output
-    :onyx/medium :function
+    :onyx/medium :kafka
+    :kafka/topic "event"
+    :kafka/zookeeper "127.0.0.1:2181"
+    :kafka/serializer-fn :witan.cqrs.jobs.shared/serialize-message-json
+    :kafka/request-size 307200
     :onyx/batch-size batch-size
     :onyx/batch-timeout batch-timeout
     :onyx/doc "Identity output"}
@@ -122,35 +76,25 @@
     :onyx/batch-timeout batch-timeout
     :onyx/doc "Identity output"}])
 
-(def logger (agent nil))
-(def pad-length 22)
-(defn log-batch [event lifecycle]
-  (let [task-name (:onyx/name (:onyx.core/task-map event))]
-    (doseq [m (map :message (mapcat :leaves (:tree (:onyx.core/results event))))]
-      (let [prefix (format (str "> %-" pad-length "s") task-name)]
-        (send logger (fn [_] (println prefix " segment: " m))))))
-  {})
-
-(def log-calls
-  {:lifecycle/after-batch log-batch})
-
 (def lifecycles
   (->> (build-catalog 0 0)
        (map :onyx/name)
        (mapv #(hash-map :lifecycle/task %
                         :lifecycle/calls :witan.cqrs.jobs.shared/log-calls))
        (into [{:lifecycle/task :command/in-queue
-               :lifecycle/calls :onyx.plugin.kafka/read-messages-calls}])) )
+               :lifecycle/calls :onyx.plugin.kafka/read-messages-calls}
+              {:lifecycle/task :event/out-queue
+               :lifecycle/calls :onyx.plugin.kafka/write-messages-calls}])) )
 
-(defn command? [event old-segment new-segment all-new-segments]
-  (contains? new-segment :command))
+(defn error? [event old-segment new-segment all-new-segments]
+  (contains? new-segment :error))
 
 (def constantly-true (constantly true))
 
 (def flow-conditions
   [{:flow/from :command/coerce
     :flow/to [:command/process]
-    :flow/predicate :witan.cqrs.jobs.commands/command?}
+    :flow/predicate [:not :witan.cqrs.jobs.commands/error?]}
    {:flow/from :command/coerce
     :flow/to [:command/store]
     :flow/predicate :witan.cqrs.jobs.commands/constantly-true}])
